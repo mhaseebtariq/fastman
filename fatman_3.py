@@ -31,15 +31,22 @@ if __name__ == "__main__":
     # This is important | Without setting the checkpoint directory, GraphFrames will fail
     spark.sparkContext.setCheckpointDir(".")
 
+    data = spark.read.parquet(f"{MAIN_LOCATION}ftm-input-filtered")
+    dates = sorted([str(x) for x in data.select("transaction_date").distinct().toPandas()["transaction_date"].tolist()])
+    LOGGER.info(f"`dates` found = {len(dates)} [{min(dates)} -> {max(dates)}]")
+    max_date = str(pd.to_datetime(min(dates)).date() + timedelta(days=365))
+
     pattern = "(x1) - [e1] -> (x2)"
     nodes_days = int(WINDOW * 2)
     location_output = f"{MAIN_LOCATION}ftm-co-occurrence-weights-input/"
-    for start_date in pd.date_range(s.MIN_TRX_DATE, (pd.to_datetime(s.MAX_TRX_DATE) + timedelta(days=WINDOW)).date()):
-        start_date = str(start_date.date())
-        if start_date > s.MAX_TRX_DATE:
+    max_node_date = str((pd.to_datetime(max_date) + timedelta(days=WINDOW)).date())
+    for start_date in dates:
+        if start_date > max_date:
             break
         start_time = time.time()
-        nodes_dates = [str(x.date()) for x in sorted(pd.date_range(start_date, periods=nodes_days, freq="d"))]
+        nodes_dates = [
+            str(x.date()) for x in pd.date_range(start_date, periods=nodes_days, freq="d") if x <= max_node_date
+        ]
         nodes_locations = [f"{nodes_location}transaction_date={x}/" for x in nodes_dates]
         day_edges = spark.read.parquet(f"{edges_location}src_date={start_date}/")
         day_nodes = spark.read.parquet(*nodes_locations)

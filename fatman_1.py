@@ -17,6 +17,8 @@ if __name__ == "__main__":
 
     settings, spark = ju.setup_job("staging", args.pipeline_prefix_path, args.execution_id)
 
+    # NOTE: This should generate data for 1 year + 21 (WINDOW setting) days
+
     branch = "feature/synthetic-evaluation"
     branch_location = f"s3a://{BUCKET}/community-detection/{branch}/"
     tem = spark.read.parquet(f"{branch_location}preprocess/transaction_entity_mapping")
@@ -105,45 +107,31 @@ if __name__ == "__main__":
     is_tmnl = ~sf.isnull("counter_tmnl_er_id")
     is_credit = tem.debit_credit == "C"
     is_debit = tem.debit_credit == "D"
+    is_wire = ~tem.cash_related
 
-    non_tmnl_credits = tem.where(is_non_tmnl & is_credit).withColumnRenamed("counter_party_id", "source")
+    non_tmnl_credits = tem.where(is_non_tmnl & is_credit & is_wire)
     non_tmnl_credits = (
-        (
-            non_tmnl_credits.withColumn(
-                "target",
-                sf.when(non_tmnl_credits.cash_related, sf.concat(sf.lit("cash-"), non_tmnl_credits.source)).otherwise(
-                    non_tmnl_credits.tmnl_party_id
-                ),
-            )
-            .withColumnRenamed("counter_party_bank_id", "source_bank_id")
-            .withColumnRenamed("bank_id", "target_bank_id")
-            .withColumn("source_country", sf.substring("source", 38, 2))
-            .withColumn("target_country", sf.lit("NL"))
-            .drop(*columns_to_drop)
-            .drop("tmnl_party_id")
-        )
+        non_tmnl_credits.withColumnRenamed("counter_party_id", "source")
+        .withColumnRenamed("tmnl_party_id", "target")
+        .withColumnRenamed("counter_party_bank_id", "source_bank_id")
+        .withColumnRenamed("bank_id", "target_bank_id")
+        .withColumn("source_country", sf.substring("source", 38, 2))
+        .withColumn("target_country", sf.lit("NL"))
+        .drop(*columns_to_drop)
         .coalesce(32)
         .cache()
     )
     LOGGER.info(f"`non_tmnl_credits` count = {non_tmnl_credits.count():,}")
 
-    non_tmnl_debits = tem.where(is_non_tmnl & is_debit)
+    non_tmnl_debits = tem.where(is_non_tmnl & is_debit & is_wire)
     non_tmnl_debits = (
-        (
-            non_tmnl_debits.withColumn(
-                "source",
-                sf.when(
-                    non_tmnl_debits.cash_related, sf.concat(sf.lit("cash-"), non_tmnl_debits.counter_party_id)
-                ).otherwise(non_tmnl_debits.tmnl_party_id),
-            )
-            .withColumnRenamed("counter_party_id", "target")
-            .withColumnRenamed("bank_id", "source_bank_id")
-            .withColumnRenamed("counter_party_bank_id", "target_bank_id")
-            .withColumn("source_country", sf.lit("NL"))
-            .withColumn("target_country", sf.substring("source", 38, 2))
-            .drop(*columns_to_drop)
-            .drop("tmnl_party_id")
-        )
+        non_tmnl_debits.withColumnRenamed("tmnl_party_id", "source")
+        .withColumnRenamed("counter_party_id", "target")
+        .withColumnRenamed("bank_id", "source_bank_id")
+        .withColumnRenamed("counter_party_bank_id", "target_bank_id")
+        .withColumn("source_country", sf.lit("NL"))
+        .withColumn("target_country", sf.substring("source", 38, 2))
+        .drop(*columns_to_drop)
         .coalesce(32)
         .cache()
     )
@@ -152,28 +140,61 @@ if __name__ == "__main__":
     tmnl_transactions = (
         sh.join(
             iban_party_mapping,
-            tem.where(is_tmnl & is_credit),
+            tem.where(is_tmnl & is_credit & is_wire),
             sh.JoinStatement("account_iban", "counter_party_id"),
             how="inner",
             overwrite_strategy="left",
         )
     ).drop("account_iban", "counter_party_id")
     tmnl_transactions = (
-        (
-            tmnl_transactions.withColumnRenamed("tmnl_party_id_mapped", "source")
-            .withColumnRenamed("tmnl_party_id", "target")
-            .withColumnRenamed("counter_party_bank_id", "source_bank_id")
-            .withColumnRenamed("bank_id", "target_bank_id")
-            .withColumn("source_country", sf.lit("NL"))
-            .withColumn("target_country", sf.lit("NL"))
-            .drop(*columns_to_drop)
-        )
+        tmnl_transactions.withColumnRenamed("tmnl_party_id_mapped", "source")
+        .withColumnRenamed("tmnl_party_id", "target")
+        .withColumnRenamed("counter_party_bank_id", "source_bank_id")
+        .withColumnRenamed("bank_id", "target_bank_id")
+        .withColumn("source_country", sf.lit("NL"))
+        .withColumn("target_country", sf.lit("NL"))
+        .drop(*columns_to_drop)
         .coalesce(32)
         .cache()
     )
     LOGGER.info(f"`tmnl_transactions` count = {tmnl_transactions.count():,}")
 
-    data = non_tmnl_credits.unionByName(non_tmnl_debits).unionByName(tmnl_transactions)
+    cash_credits = tem.where(is_credit & tem.cash_related)
+    cash_credits = (
+        cash_credits.withColumn("source", sf.concat(sf.lit("cash-"), cash_credits.tmnl_party_id))
+        .withColumnRenamed("tmnl_party_id", "target")
+        .withColumnRenamed("counter_party_bank_id", "source_bank_id")
+        .withColumnRenamed("bank_id", "target_bank_id")
+        .withColumn("source_country", sf.substring("source", 38, 2))
+        .withColumn("target_country", sf.lit("NL"))
+        .drop(*columns_to_drop)
+        .drop("counter_party_id")
+        .coalesce(32)
+        .cache()
+    )
+    LOGGER.info(f"`cash_credits` count = {cash_credits.count():,}")
+
+    cash_debits = tem.where(is_debit & tem.cash_related)
+    cash_debits = (
+        cash_debits.withColumn("target", sf.concat(sf.lit("cash-"), cash_debits.tmnl_party_id))
+        .withColumnRenamed("tmnl_party_id", "source")
+        .withColumnRenamed("bank_id", "source_bank_id")
+        .withColumnRenamed("counter_party_bank_id", "target_bank_id")
+        .withColumn("source_country", sf.lit("NL"))
+        .withColumn("target_country", sf.substring("source", 38, 2))
+        .drop(*columns_to_drop)
+        .drop("counter_party_id")
+        .coalesce(32)
+        .cache()
+    )
+    LOGGER.info(f"`cash_debits` count = {cash_debits.count():,}")
+
+    data = (
+        non_tmnl_credits.unionByName(non_tmnl_debits)
+        .unionByName(tmnl_transactions)
+        .unionByName(cash_credits)
+        .unionByName(cash_debits)
+    )
     data = (
         data.where(data.source != data.target)
         .withColumn(

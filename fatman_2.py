@@ -56,30 +56,35 @@ if __name__ == "__main__":
 
     data = spark.read.parquet(f"{MAIN_LOCATION}ftm-input")
 
-    input_filtered = (
-        data.withColumn("count_out", sf.count("source").over(Window.partitionBy("source")))
-        .withColumn("count_in", sf.count("target").over(Window.partitionBy("target")))
-        .where(
-            (sf.col("count_out") < MAX_CENTRALITY_ENTIRE_PERIOD) & (sf.col("count_in") < MAX_CENTRALITY_ENTIRE_PERIOD)
-        )
-        .drop("count_out", "count_in")
+    whitelisted_sources = data.groupby("source").agg(sf.countDistinct("target").alias("total"))
+    whitelisted_sources = whitelisted_sources.where(whitelisted_sources.total > MAX_CENTRALITY_ENTIRE_PERIOD)
+    whitelisted_targets = data.groupby("target").agg(sf.countDistinct("source").alias("total"))
+    whitelisted_targets = whitelisted_targets.where(whitelisted_targets.total > MAX_CENTRALITY_ENTIRE_PERIOD)
+    whitelisted = whitelisted_sources.select(sf.col("source").alias("nid")).union(
+        whitelisted_targets.select(sf.col("target").alias("nid"))
+    )
+    whitelisted_location = f"{MAIN_LOCATION}ftm-whitelisted"
+    whitelisted.write.parquet(whitelisted_location, mode="overwrite")
+    whitelisted = spark.read.parquet(whitelisted_location)
+    LOGGER.info(f"`whitelisted` count = {whitelisted.count():,}")
+
+    input_filtered = data.join(
+        whitelisted, (data.source == whitelisted.nid) | (data.target == whitelisted.nid), how="left_anti"
     )
     location = f"{MAIN_LOCATION}ftm-input-filtered"
     input_filtered.repartition("transaction_date").write.partitionBy("transaction_date").mode("overwrite").parquet(
         location
     )
-
     data = spark.read.parquet(location)
     LOGGER.info(f"`data_filtered` count = {data.count():,}")
 
     left_columns = {x.name: f"{x.name}_left" for x in data.schema}
     location_output = f"{MAIN_LOCATION}ftm-joins/"
-    dates = [
-        str(x.date())
-        for x in pd.date_range(s.MIN_TRX_DATE, (pd.to_datetime(s.MAX_TRX_DATE) + timedelta(days=WINDOW)).date())
-    ]
+    dates = sorted([str(x) for x in data.select("transaction_date").distinct().toPandas()["transaction_date"].tolist()])
+    LOGGER.info(f"`dates` found = {len(dates)} [{min(dates)} -> {max(dates)}]")
+    max_date = str(pd.to_datetime(min(dates)).date() + timedelta(days=365))
     for transaction_date in dates:
-        if transaction_date > s.MAX_TRX_DATE:
+        if transaction_date > max_date:
             break
         start_time = time.time()
         start_index = dates.index(transaction_date)

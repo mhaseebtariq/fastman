@@ -14,6 +14,35 @@ BUCKET = "tmnl-prod-data-scientist-sagemaker-data-intermediate"
 MAIN_LOCATION = f"s3a://{BUCKET}/community-detection/exploration/"
 WINDOW = 21  # days
 FLOW_SECONDS = 21 * 24 * 60 * 60
+HIGH_RISK_COUNTRIES = [
+    "AL",
+    "BB",
+    "BF",
+    "KH",
+    "KY",
+    "KP",
+    "CD",
+    "GI",
+    "HT",
+    "IR",
+    "JM",
+    "JO",
+    "ML",
+    "MA",
+    "MZ",
+    "MM",
+    "PA",
+    "PH",
+    "PK",
+    "SN",
+    "SS",
+    "SY",
+    "TZ",
+    "TR",
+    "UG",
+    "AE",
+    "YE",
+]
 
 
 class BankAccount:
@@ -128,6 +157,8 @@ if __name__ == "__main__":
             st.StructField("dispensers", st.IntegerType(), nullable=False),
             st.StructField("intermediates", st.IntegerType(), nullable=False),
             st.StructField("sinks", st.IntegerType(), nullable=False),
+            st.StructField("sources", st.IntegerType(), nullable=False),
+            st.StructField("targets", st.IntegerType(), nullable=False),
             st.StructField("dispensed", st.IntegerType(), nullable=False),
             st.StructField("sunk", st.IntegerType(), nullable=False),
             st.StructField("percentage_forwarded", st.FloatType(), nullable=False),
@@ -184,9 +215,16 @@ if __name__ == "__main__":
         dispensed = 1 if dispensed < 1 else dispensed
         percentage_forwarded = sunk / dispensed
         label, label_cluster = input_data.iloc[0]["label"], input_data.iloc[0]["label_cluster"]
-        source_accounts = list(set(dispense_transactions["source"]))
-        target_accounts = list(set(sink_transactions["target"]))
-        max_flow = get_max_flow(input_data, source_accounts, target_accounts)
+        # source_accounts = list(set(dispense_transactions["source"]))
+        source_accounts = list(input_data.loc[input_data.source.str.startswith("cash-"), "source"].unique())
+        # target_accounts = list(set(sink_transactions["target"]))
+        target_accounts = list(
+            input_data.loc[input_data.target_country.apply(lambda x: x in HIGH_RISK_COUNTRIES), "target"].unique()
+        )
+        if (not source_accounts) or (not target_accounts):
+            max_flow = 0
+        else:
+            max_flow = get_max_flow(input_data, source_accounts, target_accounts)
         output = pd.DataFrame(
             [
                 [
@@ -200,6 +238,8 @@ if __name__ == "__main__":
                     len(dispensers),
                     len(intermediates),
                     len(sinks),
+                    len(source_accounts),
+                    len(target_accounts),
                     dispensed,
                     sunk,
                     percentage_forwarded,
@@ -217,6 +257,8 @@ if __name__ == "__main__":
                 "dispensers",
                 "intermediates",
                 "sinks",
+                "sources",
+                "targets",
                 "dispensed",
                 "sunk",
                 "percentage_forwarded",
