@@ -14,6 +14,7 @@ WINDOW = 21  # days
 
 
 if __name__ == "__main__":
+    # Runtime ~2 hours on ml.m5.4xlarge x 10 | with volume_size_in_gb = 500
     LOGGER.info("Starting the `fatman_4` job")
 
     # Carry-forward weight for a window

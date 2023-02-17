@@ -11,6 +11,7 @@ MAIN_LOCATION = f"s3a://{BUCKET}/community-detection/exploration/"
 
 
 if __name__ == "__main__":
+    # Runtime ~2.5 hours on ml.r5.12xlarge x 1
     LOGGER.info("Starting the `fatman_5` job")
 
     # Community detection on a window
@@ -27,7 +28,8 @@ if __name__ == "__main__":
     # This is a bug, this should not happen
     size_before = data.shape[0]
     data = data.loc[data["weight"] > 0, :]
-    LOGGER.info(f"Found {size_before - data.shape[0]} edges with negative weights")
+    LOGGER.info(f"Found {(size_before - data.shape[0]):,} edges with negative weights")
+    LOGGER.info(f"`edges` count = {data.shape[0]:,}")
 
     graph = ig.Graph.DataFrame(data, use_vids=False, directed=True)
     LOGGER.info("Graph Loaded")

@@ -10,6 +10,7 @@ BUCKET = "tmnl-prod-data-scientist-sagemaker-data-intermediate"
 
 
 if __name__ == "__main__":
+    # Runtime ~40 minutes on ml.m5.4xlarge x 10
     LOGGER.info("Starting the `fatman_1` job")
 
     args = ju.parse_job_arguments()
@@ -28,7 +29,6 @@ if __name__ == "__main__":
     link_party_product_account = spark.read.parquet(f"{branch_location}staging/dim_link_party_product_account")
 
     output_columns = [
-        "id",
         "source",
         "source_bank_id",
         "source_country",

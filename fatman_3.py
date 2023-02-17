@@ -13,9 +13,11 @@ LOGGER = s.get_logger(__name__)
 BUCKET = "tmnl-prod-data-scientist-sagemaker-data-intermediate"
 MAIN_LOCATION = f"s3a://{BUCKET}/community-detection/exploration/"
 WINDOW = 21  # days
+MIN_CO_OCCURRENCE_WEIGHT = 0.01
 
 
 if __name__ == "__main__":
+    # Runtime ~6 hours on ml.m5.4xlarge x 10 | with volume_size_in_gb = 500
     LOGGER.info("Starting the `fatman_3` job")
 
     # Co-occurrence weight for the entire period (1 year)
@@ -44,9 +46,8 @@ if __name__ == "__main__":
         if start_date > max_date:
             break
         start_time = time.time()
-        nodes_dates = [
-            str(x.date()) for x in pd.date_range(start_date, periods=nodes_days, freq="d") if x <= max_node_date
-        ]
+        nodes_dates = [str(x.date()) for x in pd.date_range(start_date, periods=nodes_days, freq="d")]
+        nodes_dates = [x for x in nodes_dates if x <= max_node_date]
         nodes_locations = [f"{nodes_location}transaction_date={x}/" for x in nodes_dates]
         day_edges = spark.read.parquet(f"{edges_location}src_date={start_date}/")
         day_nodes = spark.read.parquet(*nodes_locations)
@@ -77,9 +78,9 @@ if __name__ == "__main__":
         input_data.loc[:, "weight"] = input_data.loc[:, "end"] / input_data.loc[:, "dst_count_per_src"]
         input_data.loc[:, "src"] = input_data.start + "-" + input_data.middle
         input_data.loc[:, "dst"] = input_data.middle + f"-{end}"
-        return input_data.loc[:, ["src", "dst", "weight"]]
+        return input_data.loc[input_data["weight"] > MIN_CO_OCCURRENCE_WEIGHT, ["src", "dst", "weight"]]
 
-    edges_connections = spark.read.parquet(f"{location_output}")
+    edges_connections = spark.read.parquet(location_output)
     dst_counts = edges_connections.groupby("start", "middle").agg(sf.count("end").alias("dst_count_per_src")).cache()
     LOGGER.info(f"{dst_counts.count():,} `sources` found")
 

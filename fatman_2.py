@@ -15,10 +15,10 @@ MAIN_LOCATION = f"s3a://{BUCKET}/community-detection/exploration/"
 WINDOW = 21  # days
 # In 13 months (entire period for the input data),
 # - all accounts with more than this many incoming "OR" outgoing connections are dropped
-MAX_CENTRALITY_ENTIRE_PERIOD = 10000
+MAX_CENTRALITY_ENTIRE_PERIOD = 5000
 # Within a window (see WINDOW length),
 # - all accounts with less than this much total incoming "AND" total outgoing transactions are dropped
-MIN_TOTAL_TRANSACTION_IN_A_WINDOW = 500
+MIN_TOTAL_TRANSACTION_IN_A_WINDOW = 900
 
 
 def filter_window_transactions(dataframe):
@@ -47,6 +47,7 @@ def max_timestamp(dt):
 
 
 if __name__ == "__main__":
+    # Runtime ~5 hours on ml.m5.4xlarge x 10
     LOGGER.info("Starting the `fatman_2` job")
 
     args = ju.parse_job_arguments()
@@ -56,20 +57,21 @@ if __name__ == "__main__":
 
     data = spark.read.parquet(f"{MAIN_LOCATION}ftm-input")
 
-    whitelisted_sources = data.groupby("source").agg(sf.countDistinct("target").alias("total"))
-    whitelisted_sources = whitelisted_sources.where(whitelisted_sources.total > MAX_CENTRALITY_ENTIRE_PERIOD)
-    whitelisted_targets = data.groupby("target").agg(sf.countDistinct("source").alias("total"))
-    whitelisted_targets = whitelisted_targets.where(whitelisted_targets.total > MAX_CENTRALITY_ENTIRE_PERIOD)
-    whitelisted = whitelisted_sources.select(sf.col("source").alias("nid")).union(
-        whitelisted_targets.select(sf.col("target").alias("nid"))
+    connections_incoming = (
+        data.select(sf.col("target").alias("node"), sf.col("source").alias("connection")).drop_duplicates().cache()
     )
-    whitelisted_location = f"{MAIN_LOCATION}ftm-whitelisted"
-    whitelisted.write.parquet(whitelisted_location, mode="overwrite")
-    whitelisted = spark.read.parquet(whitelisted_location)
+    LOGGER.info(f"`connections_incoming` count = {connections_incoming.count():,}")
+    connections_outgoing = connections_incoming.select(
+        sf.col("connection").alias("node"), sf.col("node").alias("connection")
+    )
+    connections = connections_incoming.union(connections_outgoing).drop_duplicates().cache()
+    LOGGER.info(f"`connections` count = {connections.count():,}")
+    whitelisted = connections.groupby("node").agg(sf.count("connection").alias("connections"))
+    whitelisted = whitelisted.where(whitelisted.connections >= MAX_CENTRALITY_ENTIRE_PERIOD).select("node")
     LOGGER.info(f"`whitelisted` count = {whitelisted.count():,}")
 
     input_filtered = data.join(
-        whitelisted, (data.source == whitelisted.nid) | (data.target == whitelisted.nid), how="left_anti"
+        whitelisted, (data.source == whitelisted.node) | (data.target == whitelisted.node), how="left_anti"
     )
     location = f"{MAIN_LOCATION}ftm-input-filtered"
     input_filtered.repartition("transaction_date").write.partitionBy("transaction_date").mode("overwrite").parquet(
