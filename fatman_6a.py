@@ -104,15 +104,28 @@ class ProxyBank:
 
         from_account.send(amount_sender_can_transfer, not sender_has_unlimited_funds)
         to_account.receive(from_account_id, amount_sender_can_transfer, at)
+        return amount_sender_can_transfer > 0
 
     def simulate(self, transactions):
         transactions.sort_values("transaction_timestamp", inplace=True)
         bank_accounts = set(transactions["source"]).union(transactions["target"])
         for name in bank_accounts:
             self.register(name)
+        transactions.loc[:, "involved"] = False
+        transactions.loc[:, "dispensed"] = 0
+        transactions.loc[:, "sunk"] = 0
         columns = ["source", "target", "amount", "transaction_timestamp"]
-        for from_account, to_account, amount, at in transactions.loc[:, columns].values:
-            self.transfer(amount, from_account, to_account, at)
+        for index, row in transactions.iterrows():
+            from_account, to_account, amount, at = [row[x] for x in columns]
+            involved = self.transfer(amount, from_account, to_account, at)
+            if not involved:
+                continue
+            transactions.loc[index, "involved"] = involved
+            if from_account in self.sources:
+                transactions.loc[index, "dispensed"] += involved
+            if to_account in self.targets:
+                transactions.loc[index, "sunk"] += involved
+        return transactions.loc[transactions.involved, :]
 
 
 if __name__ == "__main__":
@@ -148,101 +161,98 @@ if __name__ == "__main__":
     communities = spark.read.parquet(location)
     schema = st.StructType(
         [
-            st.StructField("component_sizes", st.StringType(), nullable=False),
+            st.StructField("transactions", st.IntegerType(), nullable=False),
             st.StructField("label", st.IntegerType(), nullable=False),
             st.StructField("label_cluster", st.IntegerType(), nullable=False),
-            st.StructField("diameter", st.IntegerType(), nullable=False),
+            st.StructField("accounts", st.IntegerType(), nullable=False),
+            st.StructField("sources", st.IntegerType(), nullable=False),
+            st.StructField("targets", st.IntegerType(), nullable=False),
             st.StructField("in_scope_transactions", st.IntegerType(), nullable=False),
             st.StructField("in_scope_accounts", st.IntegerType(), nullable=False),
+            st.StructField("in_scope_component_sizes", st.StringType(), nullable=False),
+            st.StructField("in_scope_diameter", st.IntegerType(), nullable=False),
             st.StructField("dispensers", st.IntegerType(), nullable=False),
             st.StructField("intermediates", st.IntegerType(), nullable=False),
             st.StructField("sinks", st.IntegerType(), nullable=False),
             st.StructField("dispensed", st.IntegerType(), nullable=False),
             st.StructField("sunk", st.IntegerType(), nullable=False),
+            st.StructField("max_flow", st.IntegerType(), nullable=False),
             st.StructField("percentage_forwarded", st.FloatType(), nullable=False),
         ]
     )
 
     def simulation(transactions, source_accounts, target_accounts, flow_seconds=FLOW_SECONDS):
         bank = ProxyBank(source_accounts, target_accounts, flow_seconds)
-        bank.simulate(transactions)
-        return bank
+        transactions = bank.simulate(transactions)
+        max_flow = 0
+        for account in target_accounts:
+            max_flow += bank.accounts[account].received_transactions.loc[:, "amount"].sum()
+        transactions.loc[:, "max_flow"] = max_flow
+        return transactions
 
     @sf.pandas_udf(schema, sf.PandasUDFType.GROUPED_MAP)
     def community_summary(input_data):
         input_data = input_data.sort_values("transaction_timestamp").reset_index(drop=True)
-        left_side = input_data.copy(deep=True)
-        left_side.loc[:, "key"] = list(left_side.loc[:, "target"])
-        left_side = left_side.set_index("key")
-        right_side = input_data.copy(deep=True)
-        right_side.loc[:, "key"] = list(right_side.loc[:, "source"])
-        right_side = right_side.set_index("key")
-        joins = left_side.join(right_side, on="key", lsuffix="_left", how="inner")
-        joins = joins.loc[joins.transaction_timestamp > joins.transaction_timestamp_left, :]
-        new_columns = {x: "src_" + x.replace("_left", "") for x in joins.columns if x.endswith("_left")}
-        new_columns.update({x: "dst_" + x for x in joins.columns if not x.endswith("_left")})
-        joins = joins.rename(columns=new_columns)
-        joins = joins.rename(columns={"src_id": "src", "dst_id": "dst"})
-        columns = list(joins.columns)
-        _ = columns.remove("src")  # noqa
-        _ = columns.remove("dst")  # noqa
-        columns = ["src", "dst"] + columns
-        joins = joins.loc[:, columns]
-        graph = ig.Graph.DataFrame(joins, use_vids=False, directed=True)
-        diameter = graph.diameter()
-        diameter = 1 if np.isnan(diameter) else diameter + 1
-        component_sizes = graph.connected_components(mode="weak").sizes()
         label, label_cluster = input_data.iloc[0]["label"], input_data.iloc[0]["label_cluster"]
         source_accounts = list(input_data.loc[input_data.source.str.startswith("cash-"), "source"].unique())
         target_accounts = list(
             input_data.loc[input_data.target_country.apply(lambda x: x in HIGH_RISK_COUNTRIES), "target"].unique()
         )
-        bank = simulation(input_data, source_accounts, target_accounts)
-        all_accounts = set(input_data["source"]).union(input_data["target"])
-        in_scope_accounts = set()
-        dispensed, sunk = 0, 0
-        in_scope_transactions = 0
-        for account in all_accounts:
-            received = bank.accounts[account].received_transactions
-            received = received.loc[received["amount"] > 0, :]
-            in_scope_transactions += received.shape[0]
-            in_scope_accounts.union(received["source"].tolist())
-            received.loc[:, "received_from_source"] = received.loc[:, "source"].apply(lambda x: x in source_accounts)
-            dispensed += received.loc[received["received_from_source"], "amount"].sum()
-            if account in target_accounts:
-                sunk += received.loc[:, "amount"].sum()
-        percentage_forwarded = sunk / (dispensed or 1)
+        transactions = simulation(input_data, source_accounts, target_accounts)
+        in_scope_transactions = transactions.shape[0]
+        all_accounts = list(set(input_data["source"]).union(input_data["target"]))
+        in_scope_accounts = set(transactions["source"]).union(transactions["target"])
+        dispensers = set(source_accounts).intersection(transactions["source"])
         intermediates = in_scope_accounts.difference(set(source_accounts).union(target_accounts))
+        sinks = set(target_accounts).intersection(transactions["target"])
+        dispensed, sunk = transactions["dispensed"].sum(), transactions["sunk"].sum()
+        max_flow = transactions.iloc[0]["max_flow"]
+        percentage_forwarded = sunk / (dispensed or 1)
+
+        in_scope_graph = ig.Graph.DataFrame(transactions.loc[:, ["source", "target"]], use_vids=False, directed=True)
+        in_scope_component_sizes = in_scope_graph.connected_components(mode="weak").sizes()
+        in_scope_diameter = in_scope_graph.diameter()
+        in_scope_diameter = 1 if np.isnan(in_scope_diameter) else in_scope_diameter
 
         output = pd.DataFrame(
             [
                 [
-                    json.dumps(component_sizes),
+                    input_data.shape[0],
                     label,
                     label_cluster,
-                    diameter,
+                    len(all_accounts),
+                    len(source_accounts),
+                    len(target_accounts),
                     in_scope_transactions,
                     len(in_scope_accounts),
-                    len(source_accounts),
+                    json.dumps(in_scope_component_sizes),
+                    in_scope_diameter,
+                    len(dispensers),
                     len(intermediates),
-                    len(target_accounts),
+                    len(sinks),
                     dispensed,
                     sunk,
+                    max_flow,
                     percentage_forwarded,
                 ]
             ],
             columns=[
-                "component_sizes",
+                "transactions",
                 "label",
                 "label_cluster",
-                "diameter",
+                "accounts",
+                "sources",
+                "targets",
                 "in_scope_transactions",
                 "in_scope_accounts",
+                "in_scope_component_sizes",
+                "in_scope_diameter",
                 "dispensers",
                 "intermediates",
                 "sinks",
                 "dispensed",
                 "sunk",
+                "max_flow",
                 "percentage_forwarded",
             ],
         )
