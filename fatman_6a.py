@@ -122,9 +122,9 @@ class ProxyBank:
                 continue
             transactions.loc[index, "involved"] = involved
             if from_account in self.sources:
-                transactions.loc[index, "dispensed"] += involved
+                transactions.loc[index, "dispensed"] += row["amount"]
             if to_account in self.targets:
-                transactions.loc[index, "sunk"] += involved
+                transactions.loc[index, "sunk"] += row["amount"]
         return transactions.loc[transactions.involved, :]
 
 
@@ -187,7 +187,8 @@ if __name__ == "__main__":
         max_flow = 0
         for account in target_accounts:
             max_flow += bank.accounts[account].received_transactions.loc[:, "amount"].sum()
-        transactions.loc[:, "max_flow"] = max_flow
+        if not transactions.empty:
+            transactions.loc[:, "max_flow"] = max_flow
         return transactions
 
     @sf.pandas_udf(schema, sf.PandasUDFType.GROUPED_MAP)
@@ -206,7 +207,9 @@ if __name__ == "__main__":
         intermediates = in_scope_accounts.difference(set(source_accounts).union(target_accounts))
         sinks = set(target_accounts).intersection(transactions["target"])
         dispensed, sunk = transactions["dispensed"].sum(), transactions["sunk"].sum()
-        max_flow = transactions.iloc[0]["max_flow"]
+        max_flow = 0
+        if not transactions.empty:
+            max_flow = transactions.iloc[0]["max_flow"]
         percentage_forwarded = sunk / (dispensed or 1)
 
         in_scope_graph = ig.Graph.DataFrame(transactions.loc[:, ["source", "target"]], use_vids=False, directed=True)
