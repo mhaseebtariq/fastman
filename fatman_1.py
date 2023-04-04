@@ -7,10 +7,11 @@ import inference.src.spark.helpers as sh
 
 LOGGER = s.get_logger(__name__)
 BUCKET = "tmnl-prod-data-scientist-sagemaker-data-intermediate"
+MAIN_LOCATION = f"s3a://{BUCKET}/community-detection/exploration/"
 
 
 if __name__ == "__main__":
-    # Runtime ~40 minutes on ml.m5.4xlarge x 10
+    # Runtime ~35 minutes on ml.m5.4xlarge x 10
     LOGGER.info("Starting the `fatman_1` job")
 
     args = ju.parse_job_arguments()
@@ -20,7 +21,7 @@ if __name__ == "__main__":
 
     # NOTE: This should generate data for 1 year + 21 (WINDOW setting) days
 
-    branch = "feature/synthetic-evaluation"
+    branch = "feature/fatman"
     branch_location = f"s3a://{BUCKET}/community-detection/{branch}/"
     tem = spark.read.parquet(f"{branch_location}preprocess/transaction_entity_mapping")
     party = spark.read.parquet(f"{branch_location}staging/dim_party")
@@ -29,6 +30,7 @@ if __name__ == "__main__":
     link_party_product_account = spark.read.parquet(f"{branch_location}staging/dim_link_party_product_account")
 
     output_columns = [
+        "id",
         "source",
         "source_bank_id",
         "source_country",
@@ -222,5 +224,18 @@ if __name__ == "__main__":
     non_nullable_columns = ["source", "target", "transaction_date", "transaction_timestamp", "cash_related", "amount"]
     data = data.na.drop(how="any", subset=non_nullable_columns).select(*output_columns)
 
-    output = f"s3a://{BUCKET}/community-detection/exploration/ftm-input"
+    # Aggregate transactions happening at the exact timestamp
+    data = (
+        data.groupby(
+            ["source", "target", "transaction_timestamp", "cash_related", "source_bank_id", "target_bank_id"]
+        ).agg(
+            sf.first("transaction_date").alias("transaction_date"),
+            sf.first("id").alias("id"),
+            sf.first("source_country").alias("source_country"),
+            sf.first("target_country").alias("target_country"),
+            sf.sum("amount").alias("amount"),
+        )
+    ).select(*output_columns)
+
+    output = f"{MAIN_LOCATION}ftm-input"
     data.repartition("transaction_date").write.partitionBy("transaction_date").mode("overwrite").parquet(output)

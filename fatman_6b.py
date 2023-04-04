@@ -18,7 +18,7 @@ FLOW_SECONDS = 21 * 24 * 60 * 60
 
 if __name__ == "__main__":
     # Runtime ~10 minutes on ml.m5.4xlarge x 10
-    LOGGER.info("Starting the `fatman_6a` job")
+    LOGGER.info("Starting the `fatman_6b` job")
 
     # Summarize communities of a window
 
@@ -27,14 +27,15 @@ if __name__ == "__main__":
 
     settings, spark = ju.setup_job("staging", args.pipeline_prefix_path, args.execution_id)
 
-    communities = spark.read.parquet(f"{MAIN_LOCATION}ftm-window-communities")
-
     start_date = str(s.MIN_TRX_DATE)
-    nodes_days = int(WINDOW * 2)
+    nodes_days = int(WINDOW * 2) + 1
 
-    nodes_location = f"{MAIN_LOCATION}ftm-nodes/"
+    location_communities = f"{MAIN_LOCATION}communities/start_date={start_date}"
+    communities = spark.read.parquet(location_communities)
+
+    nodes_location = f"{MAIN_LOCATION}ftm-nodes-filtered"
     nodes_dates = [str(x.date()) for x in sorted(pd.date_range(start_date, periods=nodes_days, freq="d"))]
-    nodes_locations = [f"{nodes_location}transaction_date={x}/" for x in nodes_dates]
+    nodes_locations = [f"{nodes_location}/transaction_date={x}/" for x in nodes_dates]
     nodes = spark.read.parquet(*nodes_locations)
 
     results = communities.join(
@@ -51,8 +52,8 @@ if __name__ == "__main__":
         [
             st.StructField("component_sizes", st.StringType(), nullable=False),
             st.StructField("transactions", st.IntegerType(), nullable=False),
-            st.StructField("label", st.IntegerType(), nullable=False),
-            st.StructField("label_cluster", st.IntegerType(), nullable=False),
+            st.StructField("label", st.LongType(), nullable=False),
+            st.StructField("isolated", st.BooleanType(), nullable=False),
             st.StructField("diameter", st.IntegerType(), nullable=False),
             st.StructField("minimum_cycles", st.IntegerType(), nullable=False),
             st.StructField("accounts", st.IntegerType(), nullable=False),
@@ -105,14 +106,14 @@ if __name__ == "__main__":
         intermediates = all_accounts.difference(dispensers.union(sinks))
         dispensed = 1 if dispensed < 1 else dispensed
         percentage_forwarded = sunk / (dispensed or 1)
-        label, label_cluster = input_data.iloc[0]["label"], input_data.iloc[0]["label_cluster"]
+        label, isolated = input_data.iloc[0]["label"], input_data.iloc[0]["isolated"]
         output = pd.DataFrame(
             [
                 [
                     json.dumps(component_sizes),
                     input_data.shape[0],
                     label,
-                    label_cluster,
+                    isolated,
                     diameter,
                     minimum_cycles,
                     len(all_accounts),
@@ -128,7 +129,7 @@ if __name__ == "__main__":
                 "component_sizes",
                 "transactions",
                 "label",
-                "label_cluster",
+                "isolated",
                 "diameter",
                 "minimum_cycles",
                 "accounts",
@@ -142,5 +143,5 @@ if __name__ == "__main__":
         )
         return output
 
-    location = f"{MAIN_LOCATION}ftm-window-communities-summarized-b"
+    location = f"{MAIN_LOCATION}ftm-communities-summarized-b/start_date={start_date}"
     communities.groupby("label").apply(community_summary).write.mode("overwrite").parquet(location)

@@ -135,7 +135,7 @@ def simulation(transactions, source_accounts, target_accounts, flow_seconds=FLOW
 
 def community_summary(input_data, details=True):
     input_data = input_data.sort_values("transaction_timestamp").reset_index(drop=True)
-    label, isolated = input_data.iloc[0]["label"], bool(int(input_data.iloc[0]["isolated"]))
+    label, isolated = input_data.iloc[0]["label"], False
     source_accounts = list(input_data.loc[input_data["is_cash_deposit"], "source"].unique())
     target_accounts = list(input_data.loc[input_data["is_hr_deposit"], "target"].unique())
     transactions = simulation(input_data, source_accounts, target_accounts)
@@ -214,101 +214,90 @@ if __name__ == "__main__":
     _, folder = ju.get_input_output_folders(args)
 
     settings, spark = ju.setup_job("staging", args.pipeline_prefix_path, args.execution_id)
+    nodes = spark.read.parquet(f"{MAIN_LOCATION}ftm-nodes-window")
+    for hop in [2, 3, 4, 5]:
+        LOGGER.info(f"[Checkpoint] Processing ho {hop}")
+        communities = spark.read.parquet(f"{MAIN_LOCATION}experiments-dbj-communities")
+        communities = communities.where(communities.hops == hop).drop("hops")
+        communities = communities.join(nodes, "id", "inner").cache()
+        LOGGER.info(f"`results` count = {communities.count():,}")
 
-    start_date = str(s.MIN_TRX_DATE)
+        @sf.pandas_udf(SCHEMA, sf.PandasUDFType.GROUPED_MAP)
+        def community_summary_wrapper(input_):
+            return community_summary(input_, details=False)
 
-    location_communities = f"{MAIN_LOCATION}communities/start_date={start_date}"
-    communities = spark.read.parquet(location_communities)
+        loc = f"{MAIN_LOCATION}ftm-communities-summary-exp-dbj/hops={hop}"
+        communities.groupby("label").apply(community_summary_wrapper).write.mode("overwrite").parquet(loc)
+        summary = spark.read.parquet(loc)
+        LOGGER.info(f"`summary` count = {summary.count():,}")
 
-    nodes_location = f"{MAIN_LOCATION}ftm-nodes-filtered"
-    nodes_dates = [str(x.date()) for x in sorted(pd.date_range(start_date, periods=int(WINDOW * 2) + 1, freq="d"))]
-    nodes_locations = [f"{nodes_location}/transaction_date={x}/" for x in nodes_dates]
-    nodes = spark.read.parquet(*nodes_locations)
+        branch = "feature/fatman"
+        branch_location = f"s3a://{BUCKET}/community-detection/{branch}/"
+        business_party = spark.read.parquet(f"{branch_location}staging/dim_business_party")
 
-    results = communities.join(
-        nodes,
-        communities.name == nodes.id,
-        "inner",
-    )
-    results = results.drop("name")
-    location = f"{MAIN_LOCATION}ftm-communities-features/start_date={start_date}"
-    results.write.mode("overwrite").parquet(location)
+        source_features = (
+            business_party.join(
+                communities.select(sf.col("source").alias("tmnl_party_id")), "tmnl_party_id", how="inner"
+            )
+            .dropDuplicates()
+            .toPandas()
+        )
+        source_features.columns = [f"source_{x}" for x in source_features.columns]
+        LOGGER.info(f"`source_features` count = {source_features.shape[0]:,}")
+        source_features = source_features.set_index("source_tmnl_party_id")
 
-    communities = spark.read.parquet(location)
+        target_features = (
+            business_party.join(
+                communities.select(sf.col("target").alias("tmnl_party_id")), "tmnl_party_id", how="inner"
+            )
+            .dropDuplicates()
+            .toPandas()
+        )
+        target_features.columns = [f"target_{x}" for x in target_features.columns]
+        LOGGER.info(f"`target_features` count = {target_features.shape[0]:,}")
+        target_features = target_features.set_index("target_tmnl_party_id")
 
-    @sf.pandas_udf(SCHEMA, sf.PandasUDFType.GROUPED_MAP)
-    def community_summary_wrapper(input_):
-        return community_summary(input_, details=False)
+        summary = summary.where(summary.max_flow > 10000).toPandas()
+        columns = [
+            "label",
+            "id",
+            "transaction_timestamp",
+            "source",
+            "target",
+            "amount",
+            "cash_related",
+            "dispensed",
+            "sunk",
+            "max_flow",
+            "source_bank_id",
+            "source_country",
+            "source_incorporation_date",
+            "source_industry_code_1",
+            "source_industry_code_2",
+            "source_legal_form_desc",
+            "target_bank_id",
+            "target_country",
+            "target_incorporation_date",
+            "target_industry_code_1",
+            "target_industry_code_2",
+            "target_legal_form_desc",
+        ]
 
-    location = f"{MAIN_LOCATION}ftm-communities-summarized-a/start_date={start_date}"
-    communities.groupby("label").apply(community_summary_wrapper).write.mode("overwrite").parquet(location)
+        results = []
+        total = summary.shape[0]
+        for index, cluster in enumerate(summary.loc[:, "label"]):
+            LOGGER.info(f"Processing cluster #{index + 1} of {total}")
+            summary = community_summary(communities.where(communities.label == cluster).toPandas(), details=True)
+            summary.loc[:, "id"] = summary.loc[:, "id"].astype(int)
+            summary = summary.loc[summary["involved"], :].reset_index(drop=True)
+            ids = summary.set_index("id").to_dict()
+            summary = summary.set_index("source").join(source_features, how="left")
+            summary = summary.set_index("target").join(target_features, how="left").reset_index(drop=True)
+            summary.loc[:, "source"] = summary.loc[:, "id"].apply(lambda x: ids["source"][x])
+            summary.loc[:, "target"] = summary.loc[:, "id"].apply(lambda x: ids["target"][x])
+            summary = summary.loc[:, columns]
+            results.append(summary)
 
-    data = spark.read.parquet(location)
-
-    branch = "feature/fatman"
-    branch_location = f"s3a://{BUCKET}/community-detection/{branch}/"
-    business_party = spark.read.parquet(f"{branch_location}staging/dim_business_party")
-
-    source_features = business_party.join(
-        communities.select(sf.col("source").alias("tmnl_party_id")), "tmnl_party_id", how="inner"
-    ).dropDuplicates()
-    location = f"{MAIN_LOCATION}ftm-communities-features-source/start_date={start_date}"
-    source_features.write.mode("overwrite").parquet(location)
-    source_features = spark.read.parquet(location).toPandas()
-    source_features.columns = [f"source_{x}" for x in source_features.columns]
-    source_features = source_features.set_index("source_tmnl_party_id")
-
-    target_features = business_party.join(
-        communities.select(sf.col("target").alias("tmnl_party_id")), "tmnl_party_id", how="inner"
-    ).dropDuplicates()
-    location = f"{MAIN_LOCATION}ftm-communities-features-target/start_date={start_date}"
-    target_features.write.mode("overwrite").parquet(location)
-    target_features = spark.read.parquet(location).toPandas()
-    target_features.columns = [f"target_{x}" for x in target_features.columns]
-    target_features = target_features.set_index("target_tmnl_party_id")
-
-    data = data.where(data.max_flow > 10000).toPandas()
-    columns = [
-        "label",
-        "isolated",
-        "id",
-        "transaction_timestamp",
-        "source",
-        "target",
-        "amount",
-        "cash_related",
-        "dispensed",
-        "sunk",
-        "max_flow",
-        "source_bank_id",
-        "source_country",
-        "source_incorporation_date",
-        "source_industry_code_1",
-        "source_industry_code_2",
-        "source_legal_form_desc",
-        "target_bank_id",
-        "target_country",
-        "target_incorporation_date",
-        "target_industry_code_1",
-        "target_industry_code_2",
-        "target_legal_form_desc",
-    ]
-
-    results = []
-    total = data.shape[0]
-    for index, cluster in enumerate(data.loc[:, "label"]):
-        LOGGER.info(f"Processing cluster #{index + 1} of {total}")
-        summary = community_summary(communities.where(communities.label == cluster).toPandas(), details=True)
-        summary.loc[:, "id"] = summary.loc[:, "id"].astype(int)
-        summary = summary.loc[summary["involved"], :].reset_index(drop=True)
-        ids = summary.set_index("id").to_dict()
-        summary = summary.set_index("source").join(source_features, how="left")
-        summary = summary.set_index("target").join(target_features, how="left").reset_index(drop=True)
-        summary.loc[:, "source"] = summary.loc[:, "id"].apply(lambda x: ids["source"][x])
-        summary.loc[:, "target"] = summary.loc[:, "id"].apply(lambda x: ids["target"][x])
-        summary = summary.loc[:, columns]
-        results.append(summary)
-
-    results = pd.concat(results, ignore_index=True)
-    location = f"{MAIN_LOCATION}ftm-communities-filtered/start_date={start_date}"
-    results.to_parquet(location)
+        results = pd.concat(results, ignore_index=True)
+        location = f"{MAIN_LOCATION}ftm-communities-exp-dbj/hops={hop}"
+        results.to_parquet(location)
