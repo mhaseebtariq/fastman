@@ -11,7 +11,7 @@ The attached notebook [fastman.ipynb](./fastman.ipynb) contains the example data
 
 ```
 ! pip install matplotlib==3.4.3
-! pip install networkx==2.6.3[fastman.ipynb](fastman.ipynb)
+! pip install networkx==2.6.3
 ! pip install pandas==1.4.1
 ! pip install pyspark==3.2.0
 ! pip install graphframes==0.6
